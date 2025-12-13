@@ -1,8 +1,8 @@
 import network, time, urequests, machine, os
 
 VERSION_FILE = "version.txt"
-UPDATE_JSON  = "https://raw.githubusercontent.com/Boydsquirrel/esp-32-device-update-manager/main/version.json"
-BASE_URL     = "https://raw.githubusercontent.com/Boydsquirrel/esp-32-device-update-manager/main/"
+UPDATE_JSON  = "https://raw.githubusercontent.com/Boydsquirrel/micromate/main/version.json"
+BASE_URL     = "https://raw.githubusercontent.com/Boydsquirrel/micromate/main/"
 
 def ver(v):
     return tuple(map(int, v.split(".")))
