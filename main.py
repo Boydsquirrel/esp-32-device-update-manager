@@ -56,6 +56,9 @@ updateer.run_updater()
 print("finished updating")
 
 print("now booted up")
+# During boot
+
+updateer.show_update_log()
 while boot:
     if buttons.button_input() != 0: #autosleep
         print("Button pressed!")
