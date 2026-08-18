@@ -4,7 +4,7 @@ import math
 from machine import Pin, PWM
 from sprite import Scene
 
-piezo = PWM(Pin(25))
+piezo = PWM(Pin(11))
 piezo.freq(1000)
 piezo.duty_u16(0)
 
@@ -27,7 +27,7 @@ class Carousel:
         self.BG                = ctx["BG"]
         self.TEXT_COLOR        = ctx["TEXT_COLOR"]
         self.ACCENT            = ctx["ACCENT"]
-        self.DIM               = ctx["DIM"]
+        self.DIM                = ctx["DIM"]
 
         # Dock hooks - optional via .get() so this still runs even if
         # main.py's ctx doesn't have them (older boot script version)
@@ -55,7 +55,19 @@ class Carousel:
         print("ANIM_H =", self.ANIM_H,
               "| band buf = 320 *", self.ANIM_H, "* 2 =", 320 * self.ANIM_H * 2, "bytes")
         print("Free heap before Scene:", gc.mem_free())
-        self.scene = Scene(self.disp, band_height=16,
+        # band_height == ANIM_H: this whole strip is one band, so every
+        # icon (32px tall, fixed y - only x ever moves during scroll)
+        # is guaranteed to land in a single disp.block() call every
+        # frame instead of straddling multiple bands. That's what was
+        # causing icons to visibly tear into 3 pieces (top/middle/
+        # bottom, moving at different apparent speeds) while scrolling.
+        # Slot handles are created with sprite=None and repointed later
+        # via update_slot_sprites() (h.sprite = app.icon), which
+        # bypasses add_sprite()'s automatic whole-piece band growth -
+        # so this has to be set explicitly here rather than relying on
+        # that. At ~320*ANIM_H*2 bytes this is trivial on this board's
+        # free heap either way.
+        self.scene = Scene(self.disp, band_height=self.ANIM_H,
                             screen_width=320, screen_height=self.ANIM_H,
                             background_color=self.BG,
                             screen_y_offset=self.ANIM_Y,
@@ -188,7 +200,7 @@ class Carousel:
             gc.collect()
             
         elif btn == "select":
-            eep(600)
+            beep(600)
             self.launch_app(self.apps[self.selected])
             import json
             try:
