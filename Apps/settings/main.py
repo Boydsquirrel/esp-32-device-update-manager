@@ -9,18 +9,51 @@ from machine import Pin, PWM
 SETTINGS_PATH  = "/system/settings.json"
 _LOCATION_FILE = "/apps/weather/location.json"
 
+# ===== OWN NON-BLOCKING BUTTON POLL =====
+# button_module.py stays untouched - button_input() there is blocking
+# (waits for release) which is right for the launcher/carousel, but
+# wrong for hold-to-repeat here. Instead we read the same Pin objects
+# it already exposes as module attributes and poll them ourselves.
+_PINS = {
+    "right":  buttons.right,
+    "left":   buttons.left,
+    "select": buttons.select,
+    "alt":    buttons.alt_b,
+    "down":   buttons.down,
+    "up":     buttons.up,
+}
+
+def _raw_state():
+    """Non-blocking snapshot: {"right": True/False, ...} - True means
+    currently held down. No debounce of its own; the settings run()
+    loop's tick rate (see TICK below) is coarse enough in practice."""
+    return {name: (pin.value() == 0) for name, pin in _PINS.items()}
+
 # ===== SCHEMA =====
 ITEMS = [
     {"type": "slider", "key": "brightness", "label": "Brightness",
      "min": 0, "max": 100, "suffix": "%", "default": 100},
     {"type": "choice", "key": "ui",         "label": "Home UI",
      "options": ["carousel", "text", "grid"], "default": "carousel"},
+    {"type": "toggle", "key": "show_labels", "label": "Show App Labels",
+     "default": True},
+    {"type": "slider", "key": "layout_scale", "label": "Icon Spacing",
+     "min": 70, "max": 140, "suffix": "%", "default": 100},
+    {"type": "choice", "key": "wallpaper",   "label": "Wallpaper",
+     "options": ["black", "navy", "dark_teal", "charcoal",
+                 "gradient_blue", "gradient_purple"], "default": "black"},
+    {"type": "choice", "key": "clock_format", "label": "Clock Format",
+     "options": ["24h", "12h"], "default": "24h"},
+    {"type": "toggle", "key": "show_battery", "label": "Show Battery %",
+     "default": True},
+    {"type": "choice", "key": "wifi_display", "label": "WiFi Icon",
+     "options": ["always", "on_change"], "default": "always"},
     {"type": "action", "key": "wifi",        "label": "Wi-Fi Networks",
-     "hint": "B2=Open"},
+     "hint": "Select=Open"},
     {"type": "action", "key": "location",   "label": "Weather Location",
-     "hint": "B2=Open"},
+     "hint": "Select=Open"},
     {"type": "action", "key": "save",        "label": "Save & Exit",
-     "hint": "B2/B3=Save"},
+     "hint": "Select=Save"},
 ]
 
 # ===== COLOURS =====
@@ -42,7 +75,12 @@ SLIDER_W         = 200
 SLIDER_H         = 10
 KNOB_W           = 12
 KNOB_H           = 22
-LONG_PRESS_TICKS = 30
+
+# ===== HOLD-TO-REPEAT TUNING (units: loop ticks, see TICK below) =====
+TICK               = 0.03   # main loop poll interval, seconds
+REPEAT_START_TICKS = 12     # ~360ms held before auto-repeat kicks in
+REPEAT_MED_TICKS   = 40     # ~1.2s held before repeat speeds up
+REPEAT_FAST_TICKS  = 80     # ~2.4s held before fastest repeat
 
 # ===== TYPE SAFETY =====
 def validate_value(item, value):
@@ -143,8 +181,6 @@ def draw_header(disp):
     disp.fill_rectangle(0, 0, 320, 240, BG)
     disp.fill_rectangle(0, 0, 320, 30, 0x2104)
     disp.draw_text8x8(100, 11, "Settings", WHITE)
-    disp.fill_rectangle(0, 228, 320, 12, BG)
-    disp.draw_text8x8(5, 229, "Hold B3=Save  B3=Back  B4=Next", GREY)
 
 def draw_scroll_indicator(disp, scroll_offset, total):
     bar_area_h = MAX_VISIBLE * ITEM_HEIGHT
@@ -163,53 +199,59 @@ def draw_visible_items(disp, values, selected, scroll_offset):
     draw_scroll_indicator(disp, scroll_offset, len(ITEMS))
 
 def draw_item(disp, slot, item, value, selected):
-    y  = ITEM_START_Y + slot * ITEM_HEIGHT
-    lc = SELECT if selected else WHITE
-    disp.fill_rectangle(0, y, 315, ITEM_HEIGHT - 2, BG)
-    if selected: disp.fill_rectangle(0, y, 315, ITEM_HEIGHT - 2, 0x1082)
+    y      = ITEM_START_Y + slot * ITEM_HEIGHT
+    lc     = SELECT if selected else WHITE
+    row_bg = 0x1082 if selected else BG
+    # Single clear at the row's real background - no separate
+    # black-then-highlight pass, so nothing downstream can punch a
+    # black patch back into a highlighted row.
+    disp.fill_rectangle(0, y, 315, ITEM_HEIGHT - 2, row_bg)
     disp.draw_text8x8(10, y + 4, item["label"], lc)
     if item["type"] == "slider":
-        _draw_slider(disp, item, value, y + 24)
+        _draw_slider(disp, item, value, y + 24, row_bg)
     elif item["type"] == "toggle":
-        _draw_toggle(disp, value, y + 24)
+        _draw_toggle(disp, value, y + 24, row_bg)
     elif item["type"] == "choice":
-        _draw_choice(disp, item, value, y + 24)
+        _draw_choice(disp, item, value, y + 24, row_bg)
     elif item["type"] == "action":
-        _draw_action(disp, item, selected, y + 24, item["key"])
+        _draw_action(disp, item, selected, y + 24, item["key"], row_bg)
 
-def _draw_slider(disp, item, value, y):
+def _draw_slider(disp, item, value, y, row_bg):
     if value is None: value = item["default"]
     pct   = (value - item["min"]) / (item["max"] - item["min"])
     kx    = SLIDER_X + int(pct * SLIDER_W)
     ky    = y - KNOB_H // 2 + SLIDER_H // 2
     disp.fill_rectangle(SLIDER_X, y, SLIDER_W, SLIDER_H, WHITE)
     disp.fill_rectangle(kx - KNOB_W // 2, ky, KNOB_W, KNOB_H, RED)
-    disp.fill_rectangle(262, y - 4, 58, 18, BG)
+    disp.fill_rectangle(262, y - 4, 58, 18, row_bg)
     label = str(value) + item.get("suffix", "")
     disp.draw_text8x8(265, y, label, WHITE)
 
-def _draw_toggle(disp, value, y):
-    disp.fill_rectangle(SLIDER_X, y - 2, 80, 16, BG)
+def _draw_toggle(disp, value, y, row_bg):
+    disp.fill_rectangle(SLIDER_X, y - 2, 80, 16, row_bg)
     label = "[ ON  ]" if value else "[ OFF ]"
     color = GREEN if value else RED
     disp.draw_text8x8(SLIDER_X, y, label, color)
 
-def _draw_choice(disp, item, value, y):
+def _draw_choice(disp, item, value, y, row_bg):
+    # Shows just the current option with < > arrows plus an index
+    # (e.g. "3/6") instead of listing every option in a row - a long
+    # options list (like Wallpaper's 6 presets) used to run straight
+    # off the right edge of the screen with no way to see the rest.
+    # This layout always fits regardless of option count.
     opts = item.get("options", [])
     idx  = opts.index(value) if value in opts else 0
-    disp.fill_rectangle(SLIDER_X, y - 2, 240, 18, BG)
-    x = SLIDER_X
-    for i, opt in enumerate(opts):
-        label = opt[:8]
-        if i == idx:
-            disp.fill_rectangle(x - 2, y - 2, len(label) * 8 + 6, 14, CYAN)
-            disp.draw_text8x8(x, y, label, BG)
-        else:
-            disp.draw_text8x8(x, y, label, GREY)
-        x += len(label) * 8 + 14
+    disp.fill_rectangle(SLIDER_X, y - 2, 250, 18, row_bg)
+    label = opts[idx].replace("_", " ")[:18] if opts else "?"
+    disp.draw_text8x8(SLIDER_X, y, "<", CYAN)
+    disp.draw_text8x8(SLIDER_X + 16, y, label, WHITE)
+    disp.draw_text8x8(SLIDER_X + 16 + len(label) * 8 + 8, y, ">", CYAN)
+    if opts:
+        idx_label = str(idx + 1) + "/" + str(len(opts))
+        disp.draw_text8x8(270, y, idx_label, GREY)
 
-def _draw_action(disp, item, selected, y, key=None):
-    disp.fill_rectangle(SLIDER_X, y - 2, 250, 16, BG)
+def _draw_action(disp, item, selected, y, key, row_bg):
+    disp.fill_rectangle(SLIDER_X, y - 2, 250, 16, row_bg)
     color = CYAN if selected else GREY
 
     # For location: show current city name as the sub-label
@@ -223,7 +265,7 @@ def _draw_action(disp, item, selected, y, key=None):
             sub = "Auto-detect"
         disp.draw_text8x8(SLIDER_X, y, sub, color)
     else:
-        hint = item.get("hint", "B2=Open")
+        hint = item.get("hint", "Select=Open")
         disp.draw_text8x8(SLIDER_X, y, hint, color)
 
 # ===== VALUE LOGIC =====
@@ -244,6 +286,9 @@ def on_value_changed(key, value):
         apply_brightness(value)
 
 # ===== LOCATION SCREENS =====
+# (unchanged - still uses buttons.button_input(), which is fine here:
+# it's a modal sub-screen that only cares about discrete single presses,
+# not hold-to-repeat.)
 
 import urequests
 import gc
@@ -291,9 +336,9 @@ def _draw_loc_main(disp, saved):
         disp.draw_text8x8(10, 58, "Auto-detect", WHITE)
         disp.draw_text8x8(10, 74, "(IP geolocation)", GREY)
     disp.fill_rectangle(0, 110, 320, 2, GREY)
-    disp.draw_text8x8(10, 120, "B2: Search for a city", WHITE)
-    disp.draw_text8x8(10, 148, "B3: Use auto-detect", WHITE)
-    disp.draw_text8x8(0,  229, "B1=Back to Settings", GREY)
+    disp.draw_text8x8(10, 120, "Select: Search for a city", WHITE)
+    disp.draw_text8x8(10, 148, "Alt: Use auto-detect", WHITE)
+    disp.draw_text8x8(0,  229, "Down=Back to Settings", GREY)
 
 def _draw_loc_results(disp, results, sel):
     disp.fill_rectangle(0, 0, 320, 240, BG)
@@ -302,7 +347,7 @@ def _draw_loc_results(disp, results, sel):
     if not results:
         disp.draw_text8x8(10, 80,  "No results found.", RED)
         disp.draw_text8x8(10, 100, "Try a different name.", GREY)
-        disp.draw_text8x8(0,  229, "B1=Back", GREY)
+        disp.draw_text8x8(0,  229, "Alt=Back", GREY)
         return
     for i, r in enumerate(results):
         y = 35 + i * 38
@@ -314,12 +359,15 @@ def _draw_loc_results(disp, results, sel):
         disp.draw_text8x8(8, y,      d, c)
         coord = str(round(r["lat"], 2)) + ",  " + str(round(r["lon"], 2))
         disp.draw_text8x8(8, y + 18, coord, GREY)
-    disp.draw_text8x8(0, 229, "B1=Back B2=Down B3=Confirm", GREY)
+    disp.draw_text8x8(0, 229, "Alt=Back  Up/Dn=Move  Select=Confirm", GREY)
 
 def _location_flow(disp):
     """
     Full location sub-screen.
     Returns True if a change was made (city saved or auto-detect cleared), False if cancelled.
+    Uses the blocking buttons.button_input() throughout - this is a
+    modal picker, not a value slider, so single discrete presses are
+    exactly what's wanted here.
     """
     saved = _load_saved_location()
     _draw_loc_main(disp, saved)
@@ -328,10 +376,10 @@ def _location_flow(disp):
         btn = buttons.button_input()
         time.sleep(0.02)
 
-        if btn == 1:
+        if btn == "down":
             return False
 
-        elif btn == 2:
+        elif btn == "select":
             # Search flow
             try:
                 import keyboard
@@ -360,7 +408,7 @@ def _location_flow(disp):
 
             if not results:
                 while True:
-                    if buttons.button_input() == 1:
+                    if buttons.button_input() == "alt":
                         break
                     time.sleep(0.02)
                 _draw_loc_main(disp, saved)
@@ -372,14 +420,18 @@ def _location_flow(disp):
                 b = buttons.button_input()
                 time.sleep(0.02)
 
-                if b == 1:
+                if b == "alt":
                     break  # back to location main
 
-                elif b == 2:
+                elif b == "up":
+                    sel = (sel - 1) % len(results)
+                    _draw_loc_results(disp, results, sel)
+
+                elif b == "down":
                     sel = (sel + 1) % len(results)
                     _draw_loc_results(disp, results, sel)
 
-                elif b == 3:
+                elif b == "select":
                     r = results[sel]
                     _save_location(r["name"], r["cc"], r["lat"], r["lon"])
                     # Confirmation flash
@@ -396,7 +448,7 @@ def _location_flow(disp):
             saved = _load_saved_location()
             _draw_loc_main(disp, saved)
 
-        elif btn == 3:
+        elif btn == "alt":
             # Auto-detect
             _clear_saved_location()
             disp.fill_rectangle(0, 0, 320, 240, BG)
@@ -428,6 +480,32 @@ def clamp_scroll(selected, scroll_offset):
         return selected - MAX_VISIBLE + 1
     return scroll_offset
 
+def _repeat_interval(ticks):
+    """How many ticks between auto-repeat fires, given how long a
+    button has been continuously held. Ramps up (fires more often)
+    the longer you hold left/right."""
+    if ticks >= REPEAT_FAST_TICKS: return 1
+    if ticks >= REPEAT_MED_TICKS:  return 2
+    return 4
+
+def _move_selection(disp, values, prev_selected, new_selected, scroll_offset):
+    """Redraw just the two rows that changed (old selection, new
+    selection) instead of clearing/repainting the whole list - this is
+    what actually removes the flash/flicker on every up/down press."""
+    new_scroll = clamp_scroll(new_selected, scroll_offset)
+    if new_scroll != scroll_offset:
+        # Window had to shift - only case that still needs a full redraw.
+        draw_visible_items(disp, values, new_selected, new_scroll)
+        return new_scroll
+
+    prev_item = ITEMS[prev_selected]
+    new_item  = ITEMS[new_selected]
+    draw_item(disp, prev_selected - scroll_offset, prev_item,
+              values.get(prev_item["key"]), False)
+    draw_item(disp, new_selected - scroll_offset, new_item,
+              values.get(new_item["key"]), True)
+    return scroll_offset
+
 # ===== MAIN =====
 def run(disp):
     settings      = load_settings()
@@ -439,60 +517,79 @@ def run(disp):
     draw_header(disp)
     draw_visible_items(disp, values, selected, scroll_offset)
 
-    hold_counter = 0
-    last_btn     = None
+    prev_state = {"right": False, "left": False, "select": False,
+                  "alt": False, "down": False, "up": False}
+    hold_ticks = {"left": 0, "right": 0}
 
     while True:
-        btn = buttons.button_input()
+        state = _raw_state()
 
-        item = ITEMS[selected]
-        key  = item["key"]
+        def just_pressed(name):
+            return state[name] and not prev_state[name]
 
-        if btn == 3:
-            if item["type"] == "action" and key == "save":
-                if fire_action(disp, key, values, settings):
-                    return
-                draw_header(disp)
-                draw_visible_items(disp, values, selected, scroll_offset)
+        item       = ITEMS[selected]
+        key        = item["key"]
+        adjustable = item["type"] in ("slider", "toggle", "choice")
+
+        # ----- value adjust, left/right, with hold-to-repeat -----
+        if adjustable:
+            fired = 0  # -1, 0, or +1
+
+            if just_pressed("left"):
+                fired = 1
+                hold_ticks["left"] = 0
+            elif state["left"] and prev_state["left"]:
+                hold_ticks["left"] += 1
+                t = hold_ticks["left"] - REPEAT_START_TICKS
+                if t >= 0 and t % _repeat_interval(hold_ticks["left"]) == 0:
+                    fired = 1
             else:
-                return  # cancel, no save
-            last_btn = btn
-            time.sleep(0.05)
-            continue
+                hold_ticks["left"] = 0
 
-        # Hold speed ramp for B1/B2
-        if btn == last_btn and btn in (1, 2):
-            hold_counter += 1
+            if fired == 0:
+                if just_pressed("right"):
+                    fired = -1
+                    hold_ticks["right"] = 0
+                elif state["right"] and prev_state["right"]:
+                    hold_ticks["right"] += 1
+                    t = hold_ticks["right"] - REPEAT_START_TICKS
+                    if t >= 0 and t % _repeat_interval(hold_ticks["right"]) == 0:
+                        fired = -1
+                else:
+                    hold_ticks["right"] = 0
+            else:
+                # left owns this tick - keep right's counter honest
+                if not state["right"]:
+                    hold_ticks["right"] = 0
+
+            if fired != 0:
+                values[key] = adjust_value(item, values[key], fired)
+                on_value_changed(key, values[key])
+                draw_item(disp, selected - scroll_offset, item, values[key], True)
         else:
-            hold_counter = 0
+            hold_ticks["left"]  = 0
+            hold_ticks["right"] = 0
 
-        step = 1
-        if hold_counter > 8:  step = 2
-        if hold_counter > 20: step = 5
+        # ----- navigation / actions - single press only, no repeat -----
+        if just_pressed("down"):
+            prev_selected = selected
+            selected      = (selected + 1) % len(ITEMS)
+            scroll_offset = _move_selection(disp, values, prev_selected, selected, scroll_offset)
 
-        if btn == 1 and item["type"] not in ("action",):
-            for _ in range(step):
-                values[key] = adjust_value(item, values[key], -1)
-            on_value_changed(key, values[key])
-            draw_item(disp, selected - scroll_offset, item, values[key], True)
+        elif just_pressed("up"):
+            prev_selected = selected
+            selected      = (selected - 1) % len(ITEMS)
+            scroll_offset = _move_selection(disp, values, prev_selected, selected, scroll_offset)
 
-        elif btn == 2:
+        elif just_pressed("select"):
             if item["type"] == "action":
                 if fire_action(disp, key, values, settings):
                     return
                 draw_header(disp)
                 draw_visible_items(disp, values, selected, scroll_offset)
-            else:
-                for _ in range(step):
-                    values[key] = adjust_value(item, values[key], +1)
-                on_value_changed(key, values[key])
-                draw_item(disp, selected - scroll_offset, item, values[key], True)
 
-        elif btn == 4:
-            selected      = (selected + 1) % len(ITEMS)
-            scroll_offset = clamp_scroll(selected, scroll_offset)
-            draw_header(disp)
-            draw_visible_items(disp, values, selected, scroll_offset)
+        elif just_pressed("alt"):
+            return  # cancel, no save
 
-        last_btn = btn
-        time.sleep(0.05)
+        prev_state = state
+        time.sleep(TICK)
