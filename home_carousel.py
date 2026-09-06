@@ -1,6 +1,7 @@
 import gc
 import time
 import math
+import json
 from machine import Pin, PWM
 from sprite import Scene
 
@@ -8,13 +9,52 @@ piezo = PWM(Pin(11))
 piezo.freq(1000)
 piezo.duty_u16(0)
 
+SETTINGS_PATH = "/system/settings.json"
+
+# ("solid", color) or ("gradient", top_color, bottom_color) — RGB565
+WALLPAPERS = {
+    "black":           ("solid", 0x0000),
+    "navy":            ("solid", 0x000C),
+    "dark_teal":       ("solid", 0x0421),
+    "charcoal":        ("solid", 0x2104),
+    "gradient_blue":   ("gradient", 0x0000, 0x041F),
+    "gradient_purple": ("gradient", 0x1000, 0x780F),
+}
+DEFAULT_WALLPAPER_KEY = "black"
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def _lerp565(c1, c2, t):
+    r1, g1, b1 = (c1 >> 11) & 0x1F, (c1 >> 5) & 0x3F, c1 & 0x1F
+    r2, g2, b2 = (c2 >> 11) & 0x1F, (c2 >> 5) & 0x3F, c2 & 0x1F
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return (r << 11) | (g << 5) | b
+
+
 class Carousel:
     CENTER_X = 160
     CENTER_Y = 120
-    SPACING  = 100
-    ANIM_STEPS = 6
+    BASE_SPACING = 100
+    # Number of intermediate frames drawn during a scroll transition
+    # (not counting the final resting frame) - lower = faster/snappier
+    # scroll, higher = smoother motion. Total scroll wall-time is
+    # roughly (ANIM_STEPS+1) x per-frame render cost, so this is the
+    # most direct knob for scroll speed. Tune to taste.
+    ANIM_STEPS = 4
     ICON_SIZE = 32
     SLOT_OFFSETS = [-2, -1, 0, 1, 2]
+    # How many horizontal strips to draw for a gradient wallpaper.
+    # More = smoother fade, more fill_rectangle calls per full_clear.
+    GRADIENT_BANDS = 24
 
     def __init__(self, ctx):
         self.disp             = ctx["disp"]
@@ -51,6 +91,18 @@ class Carousel:
         self.apps = []
         self.selected = 0
 
+        # Customization state - populated by apply_settings() below,
+        # which is called before the Scene is built so its background
+        # color reflects the wallpaper straight away.
+        self.SPACING       = self.BASE_SPACING
+        self.show_labels   = True
+        self.wallpaper_key = DEFAULT_WALLPAPER_KEY
+        self.wallpaper     = WALLPAPERS[DEFAULT_WALLPAPER_KEY]
+        self._scene_bg     = self.BG
+        self._last_scene_bg = None
+
+        self.apply_settings(ctx.get("settings", {}) or {})
+
         gc.collect()
         print("ANIM_H =", self.ANIM_H,
               "| band buf = 320 *", self.ANIM_H, "* 2 =", 320 * self.ANIM_H * 2, "bytes")
@@ -67,15 +119,98 @@ class Carousel:
         # so this has to be set explicitly here rather than relying on
         # that. At ~320*ANIM_H*2 bytes this is trivial on this board's
         # free heap either way.
+        self._build_scene()
+
+    # ----- customization -----
+
+    def apply_settings(self, settings):
+        """Pull the customizable bits out of the settings dict. Safe to
+        call again after the first render (e.g. after returning from the
+        Settings app) - spacing/labels apply on the next draw for free,
+        wallpaper changes trigger a Scene rebuild if the icon-band color
+        actually changed."""
+        self.show_labels = bool(settings.get("show_labels", True))
+
+        try:
+            scale = int(settings.get("layout_scale", 100))
+        except (TypeError, ValueError):
+            scale = 100
+        scale = max(70, min(140, scale))
+        self.SPACING = int(round(self.BASE_SPACING * (scale / 100.0)))
+
+        key = settings.get("wallpaper", DEFAULT_WALLPAPER_KEY)
+        if key not in WALLPAPERS:
+            key = DEFAULT_WALLPAPER_KEY
+        self.wallpaper_key = key
+        self.wallpaper = WALLPAPERS[key]
+
+        # Scene only draws a flat color behind the icon strip, so for a
+        # gradient we sample the color at the strip's vertical middle -
+        # it blends into the gradient above/below it instead of a hard
+        # solid block, but it won't be a true gradient *through* the
+        # icons themselves (that would need a change to sprite.py's
+        # Scene class, which isn't available here).
+        self._scene_bg = self._wallpaper_color_at(self.ANIM_Y + self.ANIM_H // 2)
+
+    def reload_settings(self):
+        """Re-read settings.json and re-apply. Called at the top of
+        render_home() so changes made in the Settings app show up as
+        soon as you back out, without needing a reboot."""
+        self.apply_settings(_load_settings())
+        if self._scene_bg != self._last_scene_bg:
+            self._build_scene()
+
+    def _build_scene(self):
         self.scene = Scene(self.disp, band_height=self.ANIM_H,
                             screen_width=320, screen_height=self.ANIM_H,
-                            background_color=self.BG,
+                            background_color=self._scene_bg,
                             screen_y_offset=self.ANIM_Y,
                             invert_colors=False)
         self.slot_handles = [
             self.scene.add_sprite(None, 0, self.ICON_LOCAL_Y, visible=False)
             for _ in self.SLOT_OFFSETS
         ]
+        self._last_scene_bg = self._scene_bg
+        if self.apps:
+            self.update_slot_sprites()
+
+    def _wallpaper_color_at(self, y):
+        kind = self.wallpaper[0]
+        if kind == "solid":
+            return self.wallpaper[1]
+        _, top, bottom = self.wallpaper
+        t = (y - self.DRAW_Y) / float(max(1, self.DRAW_H))
+        t = max(0.0, min(1.0, t))
+        return _lerp565(top, bottom, t)
+
+    def draw_wallpaper(self):
+        """Paint the full carousel drawing area (excludes status bar and
+        dock) with the current wallpaper - solid fill, or banded
+        gradient approximation."""
+        disp = self.disp
+        kind = self.wallpaper[0]
+        try:
+            if kind == "solid":
+                disp.fill_rectangle(0, self.DRAW_Y, 320, self.DRAW_H, self.wallpaper[1])
+                return
+            _, top, bottom = self.wallpaper
+            bands = self.GRADIENT_BANDS
+            band_h = max(1, self.DRAW_H // bands)
+            y = self.DRAW_Y
+            drawn = 0
+            for i in range(bands):
+                t = i / float(bands - 1) if bands > 1 else 0.0
+                color = _lerp565(top, bottom, t)
+                h = band_h if i < bands - 1 else (self.DRAW_H - drawn)
+                if h <= 0:
+                    break
+                disp.fill_rectangle(0, y, 320, h, color)
+                y += h
+                drawn += h
+        except:
+            pass
+
+    # ----- rendering -----
 
     def update_slot_sprites(self):
         """Point each of the 5 fixed slot handles at the correct app's
@@ -104,10 +239,11 @@ class Carousel:
     def draw_labels_and_border(self, offset, full_clear=False):
         disp = self.disp
         if full_clear:
-            try: disp.fill_rectangle(0, self.DRAW_Y, 320, self.DRAW_H, self.BG)
-            except: pass
+            self.draw_wallpaper()
         else:
-            try: disp.fill_rectangle(0, self.TEXT_Y, 320, self.TEXT_H, self.BG)
+            try:
+                disp.fill_rectangle(0, self.TEXT_Y, 320, self.TEXT_H,
+                                     self._wallpaper_color_at(self.TEXT_Y))
             except: pass
 
         for i in range(-2, 3):
@@ -119,6 +255,8 @@ class Carousel:
             if i == 0 and offset == 0:
                 try: disp.draw_rectangle(x-40, self.BORDER_T, 80, 80, self.ACCENT)
                 except: pass
+            if not self.show_labels:
+                continue
             tc = self.TEXT_COLOR if (i == 0 and offset == 0) else self.DIM
             try:
                 nc = app.name[:16]
@@ -152,7 +290,9 @@ class Carousel:
         if not self.apps or len(self.apps) <= 1:
             return
         gc.collect()
-        try: self.disp.fill_rectangle(0, self.TEXT_Y, 320, self.TEXT_H, self.BG)
+        try:
+            self.disp.fill_rectangle(0, self.TEXT_Y, 320, self.TEXT_H,
+                                      self._wallpaper_color_at(self.TEXT_Y))
         except: pass
         dist = self.SPACING * direction
         for s in range(self.ANIM_STEPS + 1):
@@ -163,10 +303,11 @@ class Carousel:
 
     def render_home(self):
         gc.collect()
+        self.reload_settings()
         self.apps = self.list_apps()
         if not self.apps:
             try:
-                self.disp.fill_rectangle(0, self.DRAW_Y, 320, self.DRAW_H, self.BG)
+                self.draw_wallpaper()
                 self.disp.draw_text8x8(88, self.CENTER_Y, "No apps found",
                                         self.TEXT_COLOR)
             except: pass
